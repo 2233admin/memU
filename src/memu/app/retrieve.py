@@ -459,6 +459,7 @@ class RetrieveMixin:
             query_vec=query_vec,
             max_nodes=self.retrieve_config.graph.max_nodes,
             where=state.get("where"),
+            relation_categories=self.retrieve_config.graph.relation_categories,
         )
         # Convert to (id, score) tuples for consistency with other hits
         state["graph_hits"] = [

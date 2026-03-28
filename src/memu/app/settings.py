@@ -176,6 +176,10 @@ class RetrieveGraphConfig(BaseModel):
         le=1.0,
         description="Graph score weight (β) in fusion. Vector weight is 1-β.",
     )
+    relation_categories: list[str] | None = Field(
+        default=None,
+        description="Filter edges by relation category (semantic/temporal/causal/entity/synthesis). None = all.",
+    )
 
 
 class RetrieveResourceConfig(BaseModel):

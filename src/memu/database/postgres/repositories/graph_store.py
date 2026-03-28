@@ -186,9 +186,17 @@ class PostgresGraphStore(PostgresRepoBase):
     # ── Graph loading (for PPR) ────────────────────────────────────
 
     def load_graph(
-        self, where: Mapping[str, Any] | None = None
+        self,
+        where: Mapping[str, Any] | None = None,
+        relation_categories: list[str] | None = None,
     ) -> tuple[set[str], dict[str, set[str]]]:
-        """Load active node IDs and undirected adjacency from DB."""
+        """Load active node IDs and undirected adjacency from DB.
+
+        Args:
+            where: Scope filters (user_id, etc.)
+            relation_categories: If set, only load edges matching these categories.
+                None = load all edges (backward compatible).
+        """
         from sqlmodel import select
 
         node_model = self._sqla_models.GraphNode
@@ -205,8 +213,14 @@ class PostgresGraphStore(PostgresRepoBase):
                 ).all()
             }
 
+            edge_stmt = select(edge_model.from_id, edge_model.to_id)
+            if relation_categories:
+                edge_stmt = edge_stmt.where(
+                    edge_model.relation_category.in_(relation_categories)
+                )
+
             adj: dict[str, set[str]] = defaultdict(set)
-            edges = session.execute(select(edge_model.from_id, edge_model.to_id)).all()
+            edges = session.execute(edge_stmt).all()
             for from_id, to_id in edges:
                 if from_id in node_ids and to_id in node_ids:
                     adj[from_id].add(to_id)
@@ -315,7 +329,11 @@ class PostgresGraphStore(PostgresRepoBase):
     # ── Graph walk ─────────────────────────────────────────────────
 
     def graph_walk(
-        self, start_ids: set[str], depth: int = 2, where: Mapping[str, Any] | None = None
+        self,
+        start_ids: set[str],
+        depth: int = 2,
+        where: Mapping[str, Any] | None = None,
+        relation_categories: list[str] | None = None,
     ) -> set[str]:
         """BFS graph walk up to `depth` hops, undirected."""
         from sqlalchemy import or_
@@ -340,6 +358,8 @@ class PostgresGraphStore(PostgresRepoBase):
                         edge_model.to_id.in_(frontier_list),
                     )
                 )
+                if relation_categories:
+                    stmt = stmt.where(edge_model.relation_category.in_(relation_categories))
                 rows = session.execute(stmt).all()
                 neighbors: set[str] = set()
                 for from_id, to_id in rows:
@@ -644,6 +664,7 @@ class PostgresGraphStore(PostgresRepoBase):
         adj: dict[str, set[str]],
         max_nodes: int = 6,
         where: Mapping[str, Any] | None = None,
+        relation_categories: list[str] | None = None,
     ) -> RecallResult:
         """Precise path: vector/FTS seed → community expansion → walk → PPR."""
         seeds: list[tuple[str, float]] = []
@@ -667,8 +688,10 @@ class PostgresGraphStore(PostgresRepoBase):
             peers = self.get_community_peers(sid, limit=2, where=where)
             expanded.update(peers)
 
-        # Graph walk
-        walked = self.graph_walk(expanded, depth=2, where=where)
+        # Graph walk (filtered by relation categories)
+        walked = self.graph_walk(
+            expanded, depth=2, where=where, relation_categories=relation_categories
+        )
 
         # PPR ranking
         ppr = self.personalized_pagerank(node_ids, adj, seed_ids, candidate_ids=walked)
@@ -695,6 +718,7 @@ class PostgresGraphStore(PostgresRepoBase):
         adj: dict[str, set[str]],
         max_nodes: int = 6,
         where: Mapping[str, Any] | None = None,
+        relation_categories: list[str] | None = None,
     ) -> RecallResult:
         """Generalized path: community representatives → shallow walk → PPR."""
         from sqlmodel import select
@@ -730,8 +754,10 @@ class PostgresGraphStore(PostgresRepoBase):
         if not seed_ids:
             return RecallResult(nodes=[], edges=[], path="generalized")
 
-        # Shallow walk
-        walked = self.graph_walk(set(seed_ids), depth=1, where=where)
+        # Shallow walk (filtered by relation categories)
+        walked = self.graph_walk(
+            set(seed_ids), depth=1, where=where, relation_categories=relation_categories
+        )
 
         # PPR ranking
         ppr = self.personalized_pagerank(node_ids, adj, seed_ids, candidate_ids=walked)
@@ -782,15 +808,27 @@ class PostgresGraphStore(PostgresRepoBase):
         query_vec: list[float] | None = None,
         max_nodes: int = 6,
         where: Mapping[str, Any] | None = None,
+        relation_categories: list[str] | None = None,
     ) -> RecallResult:
-        """Full dual-path graph recall."""
-        node_ids, adj = self.load_graph(where=where)
+        """Full dual-path graph recall.
+
+        Args:
+            relation_categories: Filter edges by category during graph loading
+                and traversal. None = use all edges (backward compatible).
+        """
+        node_ids, adj = self.load_graph(
+            where=where, relation_categories=relation_categories
+        )
         if not node_ids:
             return RecallResult(nodes=[], edges=[], path="empty")
 
-        precise = self.recall_precise(query, query_vec, node_ids, adj, max_nodes, where=where)
+        precise = self.recall_precise(
+            query, query_vec, node_ids, adj, max_nodes,
+            where=where, relation_categories=relation_categories,
+        )
         generalized = self.recall_generalized(
-            query, query_vec, node_ids, adj, max_nodes, where=where
+            query, query_vec, node_ids, adj, max_nodes,
+            where=where, relation_categories=relation_categories,
         )
 
         return self.merge_results(precise, generalized)

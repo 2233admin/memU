@@ -106,6 +106,10 @@ class GraphEdgeModel(BaseModelMixin, GraphEdge):
     from_id: str = Field(sa_column=Column(String, nullable=False))
     to_id: str = Field(sa_column=Column(String, nullable=False))
     type: str = Field(sa_column=Column(String, nullable=False))
+    relation_category: str = Field(
+        default="semantic",
+        sa_column=Column(String, nullable=False, server_default="semantic"),
+    )
     instruction: str = Field(default="", sa_column=Column(Text, nullable=False))
     condition: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     session_id: str | None = Field(default=None, sa_column=Column(String, nullable=True))

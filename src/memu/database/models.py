@@ -118,10 +118,14 @@ class GraphNode(BaseRecord):
     embedding: list[float] | None = None
 
 
+RelationCategory = Literal["semantic", "temporal", "causal", "entity", "synthesis"]
+
+
 class GraphEdge(BaseRecord):
     from_id: str
     to_id: str
     type: str
+    relation_category: RelationCategory = "semantic"
     instruction: str = ""
     condition: str | None = None
     session_id: str | None = None
@@ -175,5 +179,6 @@ __all__ = [
     "ToolCallResult",
     "build_scoped_models",
     "compute_content_hash",
+    "RelationCategory",
     "merge_scope_model",
 ]
