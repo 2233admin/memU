@@ -155,6 +155,67 @@ class PostgresGraphStore(PostgresRepoBase):
             session.exec(delete(model).where(model.id == edge_id))
             session.commit()
 
+    # ── Fast-path linking (dual-speed write) ────────────────────────
+
+    def quick_link_node(
+        self,
+        node_id: str,
+        k: int = 3,
+        min_score: float = 0.4,
+        relation_category: str = "semantic",
+        where: Mapping[str, Any] | None = None,
+    ) -> list[Any]:
+        """Immediately link a new node to its k-nearest neighbors by embedding similarity.
+
+        This is the 'fast path' of dual-speed write: synchronous edge creation
+        at insert time. The 'slow path' (run_maintenance) handles community
+        detection and long-range edge discovery asynchronously.
+
+        Returns created edges.
+        """
+        from sqlmodel import select
+
+        node_model = self._sqla_models.GraphNode
+        scope_filters = self._build_filters(node_model, where)
+
+        with self._sessions.session() as session:
+            source = session.scalar(select(node_model).where(node_model.id == node_id))
+            if not source or source.embedding is None:
+                return []
+
+            # Find k-nearest by cosine similarity, excluding self
+            distance = node_model.embedding.cosine_distance(source.embedding)
+            score_col = (1 - distance).label("score")
+
+            stmt = (
+                select(node_model.id, score_col)
+                .where(
+                    node_model.id != node_id,
+                    node_model.status == "active",
+                    node_model.embedding.isnot(None),
+                    (1 - distance) >= min_score,
+                    *scope_filters,
+                )
+                .order_by(distance)
+                .limit(k)
+            )
+            neighbors = session.execute(stmt).all()
+
+        # Create edges (outside the read session)
+        created = []
+        for neighbor_id, _score in neighbors:
+            edge = self.create_edge(
+                from_id=node_id,
+                to_id=neighbor_id,
+                type="nearest_neighbor",
+                relation_category=relation_category,
+                instruction=f"auto-linked (score={_score:.3f})",
+                **(where or {}),
+            )
+            created.append(edge)
+
+        return created
+
     # ── Community CRUD ─────────────────────────────────────────────
 
     def create_community(self, **kwargs: Any) -> Any:
