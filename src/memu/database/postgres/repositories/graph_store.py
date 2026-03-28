@@ -715,6 +715,155 @@ class PostgresGraphStore(PostgresRepoBase):
 
             session.commit()
 
+    # ── Active memory synthesis (reflect) ───────────────────────────
+
+    def gather_community_context(
+        self,
+        community_id: str,
+        max_nodes: int = 10,
+        where: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, str]]:
+        """Gather node summaries from a community for reflection."""
+        from sqlmodel import select
+
+        node_model = self._sqla_models.GraphNode
+        scope_filters = self._build_filters(node_model, where)
+
+        with self._sessions.session() as session:
+            stmt = (
+                select(node_model)
+                .where(
+                    node_model.community_id == community_id,
+                    node_model.status == "active",
+                    *scope_filters,
+                )
+                .order_by(node_model.pagerank.desc())
+                .limit(max_nodes)
+            )
+            nodes = session.scalars(stmt).all()
+
+        return [
+            {"id": n.id, "name": n.name, "type": n.type, "description": n.description, "content": n.content}
+            for n in nodes
+        ]
+
+    def reflect(
+        self,
+        llm_fn: Any,
+        max_communities: int = 5,
+        max_nodes_per_community: int = 8,
+        where: Mapping[str, Any] | None = None,
+        embed_fn: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Synthesize new insights from existing memory communities.
+
+        This is the 'reflect' operation (Hindsight 2026 pattern): reason over
+        existing memories to generate new knowledge nodes, rather than only
+        storing what is directly observed.
+
+        Args:
+            llm_fn: Callable(prompt: str) -> str. LLM completion function.
+            max_communities: How many top communities to reflect on.
+            max_nodes_per_community: Nodes to gather per community.
+            where: Scope filters.
+            embed_fn: Optional callable(text: str) -> list[float] for embedding.
+
+        Returns:
+            List of created synthesis nodes (as dicts with id, name, content).
+        """
+        from sqlmodel import select
+
+        community_model = self._sqla_models.GraphCommunity
+
+        with self._sessions.session() as session:
+            stmt = (
+                select(community_model.id)
+                .where(community_model.node_count >= 3)
+                .order_by(community_model.node_count.desc())
+                .limit(max_communities)
+            )
+            community_ids = list(session.scalars(stmt).all())
+
+        created = []
+        for cid in community_ids:
+            context = self.gather_community_context(
+                cid, max_nodes=max_nodes_per_community, where=where
+            )
+            if len(context) < 2:
+                continue
+
+            # Build prompt
+            memory_text = "\n".join(
+                f"- [{m['type']}] {m['name']}: {m['description']}"
+                + (f" | {m['content'][:200]}" if m['content'] else "")
+                for m in context
+            )
+            prompt = (
+                "You are a memory synthesis agent. Given the following related memories "
+                "from a knowledge graph community, identify 1-2 non-obvious insights, "
+                "patterns, or connections that are NOT explicitly stated in any single memory "
+                "but emerge from considering them together.\n\n"
+                f"Memories:\n{memory_text}\n\n"
+                "For each insight, output ONE line in this format:\n"
+                "INSIGHT: <concise title> | <explanation in 1-2 sentences>\n"
+                "Only output INSIGHT lines, nothing else."
+            )
+
+            try:
+                response = llm_fn(prompt)
+            except Exception:
+                continue
+
+            # Parse insights
+            for line in response.strip().splitlines():
+                line = line.strip()
+                if not line.upper().startswith("INSIGHT:"):
+                    continue
+                parts = line[len("INSIGHT:"):].strip().split("|", 1)
+                title = parts[0].strip()
+                explanation = parts[1].strip() if len(parts) > 1 else ""
+                if not title:
+                    continue
+
+                # Create synthesis node
+                node_kwargs: dict[str, Any] = {
+                    "type": "synthesis",
+                    "name": title,
+                    "description": explanation,
+                    "content": f"Synthesized from community {cid}: {explanation}",
+                    "status": "active",
+                    "validated_count": 0,
+                    **(where or {}),
+                }
+                if embed_fn:
+                    try:
+                        node_kwargs["embedding"] = embed_fn(f"{title}. {explanation}")
+                    except Exception:
+                        pass
+
+                node = self.create_node(**node_kwargs)
+
+                # Link to source nodes with synthesis edges
+                for m in context:
+                    self.create_edge(
+                        from_id=node.id,
+                        to_id=m["id"],
+                        type="synthesized_from",
+                        relation_category="synthesis",
+                        instruction=f"Insight derived from {m['name']}",
+                        **(where or {}),
+                    )
+
+                # Quick-link to nearest neighbors
+                if node_kwargs.get("embedding"):
+                    self.quick_link_node(
+                        node.id, k=2, relation_category="semantic", where=where
+                    )
+
+                created.append({"id": node.id, "name": title, "content": explanation})
+
+        return created
+
     # ── Dual-path graph recall ─────────────────────────────────────
 
     def recall_precise(
